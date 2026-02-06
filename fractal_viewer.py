@@ -29,7 +29,8 @@ from pycuda.compiler import SourceModule
 
 getcontext().prec = 50
 
-DD_ZOOM_THRESHOLD = 1e13
+DD_ZOOM_THRESHOLD = 1e9
+MAX_ZOOM = 3.4e12  # double-double precision limit
 LOCATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locations")
 IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
 
@@ -98,26 +99,6 @@ FRACTAL_DEFAULTS = {
     9: ("0.14631660180555559192148422729312915470768486330834", "0.013644879965277797322876377459160706452458002140234", 0.4143524220660067, 50),
     10: ("0.09215930357142862058936394227472728376637419787360", "0.00432279067460318581569185286353633229477135238307", 0.41435242206600664, 50),
 }
-
-# Interesting locations - now includes fractal type
-# Format: (name, center_x, center_y, zoom, iter_offset, fractal_type)
-PRESET_LOCATIONS = [
-    ("Mandelbrot", "-0.5", "0.0", 1.0, 0, 0),
-    ("Seahorse Valley", "-0.75", "0.1", 100.0, 50, 0),
-    ("Double Spiral", "-0.7269", "0.1889", 5000.0, 100, 0),
-    ("Elephant Valley", "0.2549", "0.0005", 5000.0, 100, 0),
-    ("Triple Spiral", "-0.0883", "0.6549", 10000.0, 150, 0),
-    ("Burning Ship", "-0.5", "-0.5", 1.0, 100, 1),
-    ("Tricorn", "-0.3", "0.0", 1.0, 50, 2),
-    ("Julia: Dragon", "0.0", "0.0", 1.2, 50, 3),
-    ("Julia: Dendrite", "0.0", "0.0", 1.2, 50, 4),
-    ("Julia: Spiral", "0.0", "0.0", 1.2, 50, 5),
-    ("Julia: San Marco", "0.0", "0.0", 1.2, 50, 6),
-    ("Julia: Douady", "0.0", "0.0", 1.2, 50, 7),
-    ("Multibrot z^3", "0.0", "0.0", 1.5, 50, 8),
-    ("Multibrot z^4", "0.0", "0.0", 2.0, 50, 9),
-    ("Phoenix", "0.0", "0.0", 2.0, 50, 10),
-]
 
 CUDA_KERNEL = r"""
 #include <math.h>
@@ -454,6 +435,10 @@ BTN_H = 28
 BTN_GAP = 6
 SECTION_GAP = 14
 
+SLIDER_H = 32
+SLIDER_PAD = 16
+SLIDER_ITER_MAX = 2000
+
 COL_BG = (18, 18, 28, 210)
 COL_BTN = (55, 55, 75)
 COL_BTN_HOVER = (80, 80, 110)
@@ -484,7 +469,6 @@ class MandelbrotViewer:
         self.color_cycling = False
         self.cycle_speed = 1.0
         self.palette_id = 0
-        self.current_preset = 0
         self.aspect_id = 0
         self.save_res_idx = 0
 
@@ -497,6 +481,7 @@ class MandelbrotViewer:
         self.rotate_angle_start = 0.0
         self.last_click_time = 0.0
         self.last_click_pos = (0, 0)
+        self.slider_dragging = False
 
         # Smooth zoom animation
         self.animating = False
@@ -596,22 +581,6 @@ class MandelbrotViewer:
         self._fractal_label_y = y
         y += 18
 
-        # Preset Locations
-        y += SECTION_GAP + 4
-        self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "<", "preset_prev"))
-        self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), ">", "preset_next"))
-        y += BTN_H + BTN_GAP
-        self._preset_label_y = y
-        y += 18
-
-        # Iterations
-        y += SECTION_GAP + 4
-        self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "-100", "iter_down"))
-        self.buttons.append((pygame.Rect(px + hw + BTN_GAP, y, hw, BTN_H), "+100", "iter_up"))
-        y += BTN_H + BTN_GAP
-        self._iter_label_y = y
-        y += 18
-
         # Palette
         y += SECTION_GAP + 4
         self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "<", "palette_prev"))
@@ -661,6 +630,21 @@ class MandelbrotViewer:
             return False
         return x >= self.width - PANEL_W and y <= self._panel_h
 
+    def _point_in_slider(self, x, y):
+        return y >= self.height - SLIDER_H
+
+    def _slider_min_offset(self):
+        """Dynamic slider minimum so the left end always allows max_iter=50."""
+        auto_base = int(self.base_iter + 100 * math.log10(max(self.zoom, 1.0)))
+        return 50 - auto_base
+
+    def _slider_x_to_offset(self, mx):
+        track_x = SLIDER_PAD
+        track_w = self.width - 2 * SLIDER_PAD
+        t = max(0.0, min(1.0, (mx - track_x) / track_w))
+        iter_min = self._slider_min_offset()
+        return int(iter_min + t * (SLIDER_ITER_MAX - iter_min))
+
     # ── Button actions ────────────────────────────────────────
 
     def _do_action(self, action):
@@ -670,20 +654,6 @@ class MandelbrotViewer:
         elif action == "fractal_next":
             self.fractal_type = (self.fractal_type + 1) % len(FRACTAL_TYPES)
             self._reset_view_for_fractal()
-        elif action == "preset_prev":
-            self.current_preset = (self.current_preset - 1) % len(PRESET_LOCATIONS)
-            self._load_preset(self.current_preset)
-        elif action == "preset_next":
-            self.current_preset = (self.current_preset + 1) % len(PRESET_LOCATIONS)
-            self._load_preset(self.current_preset)
-        elif action == "iter_up":
-            self.iter_offset += 100
-            self._auto_iter()
-            self.needs_compute = True
-        elif action == "iter_down":
-            self.iter_offset -= 100
-            self._auto_iter()
-            self.needs_compute = True
         elif action == "palette_prev":
             self.palette_id = (self.palette_id - 1) % len(PALETTE_NAMES)
             self.needs_colorize = True
@@ -697,7 +667,12 @@ class MandelbrotViewer:
             self.aspect_id = (self.aspect_id + 1) % len(ASPECT_RATIOS)
             self._apply_aspect_ratio()
         elif action == "cycle_toggle":
-            self.color_cycling = not self.color_cycling
+            if self.color_cycling is False:
+                self.color_cycling = "forward"
+            elif self.color_cycling == "forward":
+                self.color_cycling = "backward"
+            else:
+                self.color_cycling = False
         elif action == "speed_down":
             self.cycle_speed = max(0.25, round(self.cycle_speed - 0.25, 2))
         elif action == "speed_up":
@@ -719,7 +694,6 @@ class MandelbrotViewer:
             self.color_cycling = False
             self.cycle_speed = 1.0
             self.palette_id = 0
-            self.current_preset = 0
             self.fractal_type = 0
             self._reset_view_for_fractal()
 
@@ -741,17 +715,6 @@ class MandelbrotViewer:
         self._alloc_gpu_buffers()
         self.needs_compute = True
         self.save_res_idx = 0
-
-    def _load_preset(self, preset_idx):
-        """Load a preset location."""
-        name, cx, cy, zoom, iter_off, ftype = PRESET_LOCATIONS[preset_idx]
-        self.center_x = Decimal(cx)
-        self.center_y = Decimal(cy)
-        self.zoom = zoom
-        self.iter_offset = iter_off
-        self.fractal_type = ftype
-        self._auto_iter()
-        self.needs_compute = True
 
     # ── Save / Load locations ────────────────────────────────
 
@@ -791,6 +754,7 @@ class MandelbrotViewer:
             "palette_id": self.palette_id,
             "fractal_type": self.fractal_type,
             "rotation": self.rotation,
+            "aspect_id": self.aspect_id,
         }
         filepath = os.path.join(LOCATIONS_DIR, filename)
         with open(filepath, "w") as f:
@@ -806,11 +770,18 @@ class MandelbrotViewer:
         self.zoom = data["zoom"]
         self.iter_offset = data["iter_offset"]
         self.color_offset = data.get("color_offset", 0.0)
-        self.color_cycling = data.get("color_cycling", False)
+        cc = data.get("color_cycling", False)
+        if cc is True:
+            cc = "forward"
+        elif cc not in ("forward", "backward"):
+            cc = False
+        self.color_cycling = cc
         self.cycle_speed = data.get("cycle_speed", 1.0)
         self.palette_id = data.get("palette_id", 0)
         self.fractal_type = data.get("fractal_type", 0)
         self.rotation = data.get("rotation", 0.0)
+        self.aspect_id = data.get("aspect_id", 0)
+        self._apply_aspect_ratio()
         self._auto_iter()
         self.needs_compute = True
 
@@ -1004,6 +975,9 @@ class MandelbrotViewer:
             f"Mouse: ({float(mouse_fx):.15g}, {float(mouse_fy):.15g})",
             f"FPS: {self.fps:.1f}",
         ]
+        if self.zoom >= MAX_ZOOM * 0.01:
+            pct = min(100.0, self.zoom / MAX_ZOOM * 100)
+            lines.append(f"Precision: {100 - pct:.0f}% remaining" if pct < 100 else "PRECISION LIMIT")
 
         padding = 6
         lh = self.font.get_linesize()
@@ -1045,49 +1019,41 @@ class MandelbrotViewer:
         self.screen.blit(self.font.render(fractal_name, True, COL_ACCENT),
                          (panel_x + PANEL_PAD, self._fractal_label_y))
 
-        # Section: PRESET LOCATIONS
-        sec_y = self.buttons[2][0].y - 18
-        self.screen.blit(self.font_head.render("LOCATION", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
-        preset_name = PRESET_LOCATIONS[self.current_preset][0]
-        self.screen.blit(self.font.render(preset_name, True, COL_ACCENT),
-                         (panel_x + PANEL_PAD, self._preset_label_y))
-
-        # Section: ITERATIONS
-        sec_y = self.buttons[4][0].y - 18
-        self.screen.blit(self.font_head.render("ITERATIONS", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
-        val = f"{self.max_iter}  (offset {self.iter_offset:+d})"
-        self.screen.blit(self.font.render(val, True, COL_TEXT), (panel_x + PANEL_PAD, self._iter_label_y))
-
         # Section: PALETTE
-        sec_y = self.buttons[6][0].y - 18
+        sec_y = self.buttons[2][0].y - 18
         self.screen.blit(self.font_head.render("PALETTE", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
         self.screen.blit(self.font.render(PALETTE_NAMES[self.palette_id], True, COL_ACCENT),
                          (panel_x + PANEL_PAD, self._palette_label_y))
 
         # Section: ASPECT RATIO
-        sec_y = self.buttons[8][0].y - 18
+        sec_y = self.buttons[4][0].y - 18
         self.screen.blit(self.font_head.render("ASPECT", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
         aspect_name = ASPECT_RATIOS[self.aspect_id][0]
         self.screen.blit(self.font.render(aspect_name, True, COL_ACCENT),
                          (panel_x + PANEL_PAD, self._aspect_label_y))
 
         # Section: COLOR CYCLE
-        sec_y = self.buttons[10][0].y - 18
+        sec_y = self.buttons[6][0].y - 18
         self.screen.blit(self.font_head.render("COLOR CYCLE", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
-        state = "ON" if self.color_cycling else "OFF"
+        if self.color_cycling == "forward":
+            state = "FWD"
+        elif self.color_cycling == "backward":
+            state = "REV"
+        else:
+            state = "OFF"
         self.screen.blit(self.font.render(f"Cycling: {state}", True, COL_TEXT),
                          (panel_x + PANEL_PAD, self._cycle_label_y))
         self.screen.blit(self.font.render(f"Speed: {self.cycle_speed:.2f}x", True, COL_TEXT),
                          (panel_x + PANEL_PAD, self._speed_label_y))
 
         # Section: SAVE / LOAD
-        sec_y = self.buttons[13][0].y - 18
+        sec_y = self.buttons[9][0].y - 18
         self.screen.blit(self.font_head.render("SAVE / LOAD", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
 
         # Draw buttons
         for i, (rect, label, action) in enumerate(self.buttons):
             hovered = rect.collidepoint(mx, my)
-            if action == "cycle_toggle" and self.color_cycling:
+            if action == "cycle_toggle" and self.color_cycling is not False:
                 color = COL_BTN_ACTIVE
             else:
                 color = COL_BTN_HOVER if hovered else COL_BTN
@@ -1101,6 +1067,43 @@ class MandelbrotViewer:
         # Tab hint at bottom
         hint = self.font.render("[Tab] Hide", True, (120, 120, 140))
         self.screen.blit(hint, (panel_x + PANEL_PAD, self._panel_h - 20))
+
+    # ── Iteration slider (bottom bar) ─────────────────────────
+
+    def draw_slider(self):
+        bar_y = self.height - SLIDER_H
+        bar = pygame.Surface((self.width, SLIDER_H), pygame.SRCALPHA)
+        bar.fill((18, 18, 28, 200))
+        self.screen.blit(bar, (0, bar_y))
+
+        track_x = SLIDER_PAD
+        track_w = self.width - 2 * SLIDER_PAD
+        track_y = bar_y + SLIDER_H // 2
+
+        # Track line
+        pygame.draw.line(self.screen, (60, 60, 80), (track_x, track_y), (track_x + track_w, track_y), 2)
+
+        # Thumb position
+        iter_min = self._slider_min_offset()
+        rng = SLIDER_ITER_MAX - iter_min
+        t = max(0.0, min(1.0, (self.iter_offset - iter_min) / rng))
+        thumb_x = int(track_x + t * track_w)
+
+        # Filled portion
+        pygame.draw.line(self.screen, COL_ACCENT, (track_x, track_y), (thumb_x, track_y), 2)
+
+        # Thumb
+        mx, my = pygame.mouse.get_pos()
+        thumb_r = 8
+        hovering = abs(mx - thumb_x) < thumb_r + 4 and abs(my - track_y) < SLIDER_H // 2
+        thumb_col = (140, 200, 255) if hovering or self.slider_dragging else COL_ACCENT
+        pygame.draw.circle(self.screen, thumb_col, (thumb_x, track_y), thumb_r)
+        pygame.draw.circle(self.screen, (200, 220, 255), (thumb_x, track_y), thumb_r, 1)
+
+        # Label
+        label = f"Iter: {self.max_iter}  (offset {self.iter_offset:+d})"
+        txt = self.font.render(label, True, COL_TEXT)
+        self.screen.blit(txt, (track_x, bar_y + 2))
 
     # ── Modal dialogs ──────────────────────────────────────────
 
@@ -1293,6 +1296,12 @@ class MandelbrotViewer:
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
+                    if self._point_in_slider(*event.pos):
+                        self.slider_dragging = True
+                        self.iter_offset = self._slider_x_to_offset(event.pos[0])
+                        self._auto_iter()
+                        self.needs_compute = True
+                        continue
                     if self._handle_panel_click(event.pos):
                         continue
                     now = time.perf_counter()
@@ -1315,18 +1324,24 @@ class MandelbrotViewer:
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
+                    self.slider_dragging = False
                     self.dragging = False
                 elif event.button == 3:
                     self.rotating = False
 
             elif event.type == pygame.MOUSEMOTION:
-                if self.dragging:
+                if self.slider_dragging:
+                    self.iter_offset = self._slider_x_to_offset(event.pos[0])
+                    self._auto_iter()
+                    self.needs_compute = True
+                elif self.dragging:
                     self._handle_drag(event.pos)
                 if self.rotating:
                     self._handle_rotate(event.pos)
 
             elif event.type == pygame.MOUSEWHEEL:
-                if not self._point_in_panel(*pygame.mouse.get_pos()):
+                mpos = pygame.mouse.get_pos()
+                if not self._point_in_panel(*mpos) and not self._point_in_slider(*mpos):
                     self.animating = False
                     self._handle_zoom(event.y)
 
@@ -1428,25 +1443,18 @@ class MandelbrotViewer:
         elif event.key == pygame.K_TAB:
             self.panel_visible = not self.panel_visible
         elif event.key == pygame.K_c:
-            self.color_cycling = not self.color_cycling
-        elif event.key == pygame.K_UP:
-            self.iter_offset += 100
-            self._auto_iter()
-            self.needs_compute = True
-        elif event.key == pygame.K_DOWN:
-            self.iter_offset -= 100
-            self._auto_iter()
-            self.needs_compute = True
+            if self.color_cycling is False:
+                self.color_cycling = "forward"
+            elif self.color_cycling == "forward":
+                self.color_cycling = "backward"
+            else:
+                self.color_cycling = False
         elif event.key == pygame.K_LEFT:
             self.palette_id = (self.palette_id - 1) % len(PALETTE_NAMES)
             self.needs_colorize = True
         elif event.key == pygame.K_RIGHT:
             self.palette_id = (self.palette_id + 1) % len(PALETTE_NAMES)
             self.needs_colorize = True
-        elif event.key == pygame.K_COMMA or event.key == pygame.K_LESS:
-            self._do_action("preset_prev")
-        elif event.key == pygame.K_PERIOD or event.key == pygame.K_GREATER:
-            self._do_action("preset_next")
         elif event.key == pygame.K_LEFTBRACKET:
             self._do_action("fractal_prev")
         elif event.key == pygame.K_RIGHTBRACKET:
@@ -1487,7 +1495,7 @@ class MandelbrotViewer:
         self.anim_start_zoom = self.zoom
         self.anim_target_cx = target_fx
         self.anim_target_cy = target_fy
-        self.anim_target_zoom = self.zoom * 8.0
+        self.anim_target_zoom = min(self.zoom * 8.0, MAX_ZOOM)
 
     def _update_animation(self):
         if not self.animating:
@@ -1519,7 +1527,7 @@ class MandelbrotViewer:
         fx_before, fy_before = self._pixel_to_fractal(mx, my)
 
         if scroll_y > 0:
-            self.zoom *= 1.3
+            self.zoom = min(self.zoom * 1.3, MAX_ZOOM)
         elif scroll_y < 0:
             self.zoom /= 1.3
 
@@ -1560,7 +1568,8 @@ class MandelbrotViewer:
                 self._update_animation()
 
                 if self.color_cycling:
-                    self.color_offset += 0.005 * self.cycle_speed
+                    direction = 1.0 if self.color_cycling == "forward" else -1.0
+                    self.color_offset += 0.005 * self.cycle_speed * direction
                     self.needs_colorize = True
 
                 if self.needs_compute or self.needs_colorize:
@@ -1570,6 +1579,7 @@ class MandelbrotViewer:
                 self.screen.blit(self.surface, (self.render_x, self.render_y))
                 self.draw_overlay()
                 self.draw_panel()
+                self.draw_slider()
                 self.draw_modal()
                 pygame.display.flip()
 
