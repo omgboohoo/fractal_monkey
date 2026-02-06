@@ -59,6 +59,21 @@ FRACTAL_TYPES = [
     ("Phoenix", 10),
 ]
 
+# Default view for each fractal type: (center_x, center_y, zoom, iter_offset)
+FRACTAL_DEFAULTS = {
+    0: ("-0.26810170634920634894882274351822159257723058694218", "0.056267777777777815295764226350661802688530433904766", 0.35012779664577565, 0),
+    1: ("-0.27716215079365079317564050491252832676385248421592", "-0.56993576091269838512981976364474714955070041857701", 0.35012779664577565, 100),
+    2: ("0.1158900793650794005919354060172860889428918478661", "0.00737988095238100367036183897741664908513060658075", 0.2693290743429043, 50),
+    3: ("0.10203831018518517761096358230894453589459663162644", "0.013817592592592609497586271499271427541957853600986", 0.3231948892114852, 50),
+    4: ("0.10203831018518517761096358230894453589459663162644", "0.013817592592592609497586271499271427541957853600986", 0.3231948892114852, 50),
+    5: ("0.10203831018518517761096358230894453589459663162644", "0.013817592592592609497586271499271427541957853600986", 0.3231948892114852, 50),
+    6: ("0.10203831018518517761096358230894453589459663162644", "0.013817592592592609497586271499271427541957853600986", 0.3231948892114852, 50),
+    7: ("0.10203831018518517761096358230894453589459663162644", "0.013817592592592609497586271499271427541957853600986", 0.3231948892114852, 50),
+    8: ("0.10629497003968257195600202755845435177255299165414", "0.016411609457671956526630818772511962720872176101914", 0.4039936115143565, 50),
+    9: ("0.14631660180555559192148422729312915470768486330834", "0.013644879965277797322876377459160706452458002140234", 0.4143524220660067, 50),
+    10: ("0.09215930357142862058936394227472728376637419787360", "0.00432279067460318581569185286353633229477135238307", 0.41435242206600664, 50),
+}
+
 # Interesting locations - now includes fractal type
 # Format: (name, center_x, center_y, zoom, iter_offset, fractal_type)
 PRESET_LOCATIONS = [
@@ -93,7 +108,8 @@ __global__ void compute_fast(
     int width, int height,
     double center_x, double center_y,
     double zoom, int max_iter,
-    int fractal_type
+    int fractal_type,
+    double rot_cos, double rot_sin
 )
 {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
@@ -101,8 +117,10 @@ __global__ void compute_fast(
     if (px >= width || py >= height) return;
 
     double aspect = (double)width / (double)height;
-    double x0 = center_x + (((double)px / (double)width - 0.5) * aspect) / zoom;
-    double y0 = center_y + (((double)py / (double)height - 0.5)) / zoom;
+    double raw_x = (((double)px / (double)width - 0.5) * aspect) / zoom;
+    double raw_y = (((double)py / (double)height - 0.5)) / zoom;
+    double x0 = center_x + raw_x * rot_cos - raw_y * rot_sin;
+    double y0 = center_y + raw_x * rot_sin + raw_y * rot_cos;
 
     double zx = 0.0, zy = 0.0, zx2 = 0.0, zy2 = 0.0;
     double cx = x0, cy = y0;
@@ -207,7 +225,8 @@ __global__ void compute_deep(
     double center_x_hi, double center_x_lo,
     double center_y_hi, double center_y_lo,
     double zoom, int max_iter,
-    int fractal_type
+    int fractal_type,
+    double rot_cos, double rot_sin
 )
 {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
@@ -215,8 +234,10 @@ __global__ void compute_deep(
     if (px >= width || py >= height) return;
 
     double aspect = (double)width / (double)height;
-    double off_x = (((double)px / (double)width - 0.5) * aspect) / zoom;
-    double off_y = (((double)py / (double)height - 0.5)) / zoom;
+    double raw_x = (((double)px / (double)width - 0.5) * aspect) / zoom;
+    double raw_y = (((double)py / (double)height - 0.5)) / zoom;
+    double off_x = raw_x * rot_cos - raw_y * rot_sin;
+    double off_y = raw_x * rot_sin + raw_y * rot_cos;
 
     double cx_hi, cx_lo, cy_hi, cy_lo;
     dd_add(center_x_hi, center_x_lo, off_x, 0.0, &cx_hi, &cx_lo);
@@ -425,23 +446,41 @@ class MandelbrotViewer:
         self.height = height
 
         # Fractal state
-        self.center_x = Decimal("-0.5")
-        self.center_y = Decimal("0.0")
-        self.zoom = 1.0
         self.base_iter = 200
-        self.iter_offset = 0
+        self.fractal_type = 0
+        cx, cy, zoom, iter_off = FRACTAL_DEFAULTS[0]
+        self.center_x = Decimal(cx)
+        self.center_y = Decimal(cy)
+        self.zoom = zoom
+        self.iter_offset = iter_off
         self.max_iter = 200
+        self.rotation = 0.0
         self.color_offset = 0.0
         self.color_cycling = False
         self.cycle_speed = 1.0
         self.palette_id = 0
         self.current_preset = 0
-        self.fractal_type = 0
 
         # Interaction state
         self.dragging = False
         self.drag_start = None
         self.drag_center_start = None
+        self.rotating = False
+        self.rotate_start = None
+        self.rotate_angle_start = 0.0
+        self.last_click_time = 0.0
+        self.last_click_pos = (0, 0)
+
+        # Smooth zoom animation
+        self.animating = False
+        self.anim_start_time = 0.0
+        self.anim_duration = 0.6
+        self.anim_start_cx = Decimal("0")
+        self.anim_start_cy = Decimal("0")
+        self.anim_target_cx = Decimal("0")
+        self.anim_target_cy = Decimal("0")
+        self.anim_start_zoom = 1.0
+        self.anim_target_zoom = 1.0
 
         # Two-pass rendering flags
         self.needs_compute = True   # rerun iteration kernel
@@ -571,10 +610,10 @@ class MandelbrotViewer:
     def _do_action(self, action):
         if action == "fractal_prev":
             self.fractal_type = (self.fractal_type - 1) % len(FRACTAL_TYPES)
-            self.needs_compute = True
+            self._reset_view_for_fractal()
         elif action == "fractal_next":
             self.fractal_type = (self.fractal_type + 1) % len(FRACTAL_TYPES)
-            self.needs_compute = True
+            self._reset_view_for_fractal()
         elif action == "preset_prev":
             self.current_preset = (self.current_preset - 1) % len(PRESET_LOCATIONS)
             self._load_preset(self.current_preset)
@@ -611,18 +650,24 @@ class MandelbrotViewer:
                 self.load_scroll = 0
                 self.load_hover = -1
         elif action == "reset":
-            self.center_x = Decimal("-0.5")
-            self.center_y = Decimal("0.0")
-            self.zoom = 1.0
-            self.iter_offset = 0
             self.color_offset = 0.0
             self.color_cycling = False
             self.cycle_speed = 1.0
             self.palette_id = 0
             self.current_preset = 0
             self.fractal_type = 0
-            self._auto_iter()
-            self.needs_compute = True
+            self._reset_view_for_fractal()
+
+    def _reset_view_for_fractal(self):
+        """Reset center, zoom, iterations, and rotation to defaults for the current fractal type."""
+        cx, cy, zoom, iter_off = FRACTAL_DEFAULTS[self.fractal_type]
+        self.center_x = Decimal(cx)
+        self.center_y = Decimal(cy)
+        self.zoom = zoom
+        self.iter_offset = iter_off
+        self.rotation = 0.0
+        self._auto_iter()
+        self.needs_compute = True
 
     def _load_preset(self, preset_idx):
         """Load a preset location."""
@@ -672,6 +717,7 @@ class MandelbrotViewer:
             "cycle_speed": self.cycle_speed,
             "palette_id": self.palette_id,
             "fractal_type": self.fractal_type,
+            "rotation": self.rotation,
         }
         filepath = os.path.join(LOCATIONS_DIR, filename)
         with open(filepath, "w") as f:
@@ -691,6 +737,7 @@ class MandelbrotViewer:
         self.cycle_speed = data.get("cycle_speed", 1.0)
         self.palette_id = data.get("palette_id", 0)
         self.fractal_type = data.get("fractal_type", 0)
+        self.rotation = data.get("rotation", 0.0)
         self._auto_iter()
         self.needs_compute = True
 
@@ -714,8 +761,12 @@ class MandelbrotViewer:
     def _pixel_to_fractal(self, px, py):
         aspect = Decimal(self.width) / Decimal(self.height)
         zoom_d = Decimal(self.zoom)
-        fx = self.center_x + (Decimal(px) / Decimal(self.width) - Decimal("0.5")) * aspect / zoom_d
-        fy = self.center_y + (Decimal(py) / Decimal(self.height) - Decimal("0.5")) / zoom_d
+        raw_x = (Decimal(px) / Decimal(self.width) - Decimal("0.5")) * aspect / zoom_d
+        raw_y = (Decimal(py) / Decimal(self.height) - Decimal("0.5")) / zoom_d
+        rc = Decimal(math.cos(self.rotation))
+        rs = Decimal(math.sin(self.rotation))
+        fx = self.center_x + raw_x * rc - raw_y * rs
+        fy = self.center_y + raw_x * rs + raw_y * rc
         return fx, fy
 
     def _auto_iter(self):
@@ -732,6 +783,9 @@ class MandelbrotViewer:
         grid_y = math.ceil(self.height / BLOCK_SIZE[1])
         grid = (grid_x, grid_y, 1)
 
+        rc = math.cos(self.rotation)
+        rs = math.sin(self.rotation)
+
         if self.zoom >= DD_ZOOM_THRESHOLD:
             cx_hi, cx_lo = self._split_double(self.center_x)
             cy_hi, cy_lo = self._split_double(self.center_y)
@@ -743,6 +797,7 @@ class MandelbrotViewer:
                 np.float64(self.zoom),
                 np.int32(self.max_iter),
                 np.int32(self.fractal_type),
+                np.float64(rc), np.float64(rs),
                 block=BLOCK_SIZE, grid=grid,
             )
         else:
@@ -754,6 +809,7 @@ class MandelbrotViewer:
                 np.float64(self.zoom),
                 np.int32(self.max_iter),
                 np.int32(self.fractal_type),
+                np.float64(rc), np.float64(rs),
                 block=BLOCK_SIZE, grid=grid,
             )
 
@@ -794,9 +850,10 @@ class MandelbrotViewer:
         mouse_fx, mouse_fy = self._pixel_to_fractal(mx, my)
         mode = "deep" if self.zoom >= DD_ZOOM_THRESHOLD else "fast"
 
+        rot_deg = math.degrees(self.rotation) % 360
         lines = [
             f"Center: ({float(self.center_x):.15g}, {float(self.center_y):.15g})",
-            f"Zoom: {self.zoom:.6e}   Kernel: {mode}",
+            f"Zoom: {self.zoom:.6e}   Kernel: {mode}   Rot: {rot_deg:.1f}\u00b0",
             f"Mouse: ({float(mouse_fx):.15g}, {float(mouse_fy):.15g})",
             f"FPS: {self.fps:.1f}",
         ]
@@ -1020,20 +1077,39 @@ class MandelbrotViewer:
                 if event.button == 1:
                     if self._handle_panel_click(event.pos):
                         continue
+                    now = time.perf_counter()
+                    dx = abs(event.pos[0] - self.last_click_pos[0])
+                    dy = abs(event.pos[1] - self.last_click_pos[1])
+                    if now - self.last_click_time < 0.35 and dx < 10 and dy < 10:
+                        self._start_smooth_zoom(event.pos)
+                        self.last_click_time = 0.0
+                        continue
+                    self.last_click_time = now
+                    self.last_click_pos = event.pos
+                    self.animating = False
                     self.dragging = True
                     self.drag_start = event.pos
                     self.drag_center_start = (self.center_x, self.center_y)
+                elif event.button == 3:
+                    self.rotating = True
+                    self.rotate_start = event.pos
+                    self.rotate_angle_start = self.rotation
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     self.dragging = False
+                elif event.button == 3:
+                    self.rotating = False
 
             elif event.type == pygame.MOUSEMOTION:
                 if self.dragging:
                     self._handle_drag(event.pos)
+                if self.rotating:
+                    self._handle_rotate(event.pos)
 
             elif event.type == pygame.MOUSEWHEEL:
                 if not self._point_in_panel(*pygame.mouse.get_pos()):
+                    self.animating = False
                     self._handle_zoom(event.y)
 
             elif event.type == pygame.VIDEORESIZE:
@@ -1147,8 +1223,48 @@ class MandelbrotViewer:
         dy = pos[1] - self.drag_start[1]
         aspect = Decimal(self.width) / Decimal(self.height)
         zoom_d = Decimal(self.zoom)
-        self.center_x = self.drag_center_start[0] - Decimal(dx) / Decimal(self.width) * aspect / zoom_d
-        self.center_y = self.drag_center_start[1] - Decimal(dy) / Decimal(self.height) / zoom_d
+        raw_x = Decimal(dx) / Decimal(self.width) * aspect / zoom_d
+        raw_y = Decimal(dy) / Decimal(self.height) / zoom_d
+        rc = Decimal(math.cos(self.rotation))
+        rs = Decimal(math.sin(self.rotation))
+        self.center_x = self.drag_center_start[0] - (raw_x * rc - raw_y * rs)
+        self.center_y = self.drag_center_start[1] - (raw_x * rs + raw_y * rc)
+        self.needs_compute = True
+
+    def _start_smooth_zoom(self, pos):
+        target_fx, target_fy = self._pixel_to_fractal(pos[0], pos[1])
+        self.animating = True
+        self.anim_start_time = time.perf_counter()
+        self.anim_start_cx = self.center_x
+        self.anim_start_cy = self.center_y
+        self.anim_start_zoom = self.zoom
+        self.anim_target_cx = target_fx
+        self.anim_target_cy = target_fy
+        self.anim_target_zoom = self.zoom * 8.0
+
+    def _update_animation(self):
+        if not self.animating:
+            return
+        t = (time.perf_counter() - self.anim_start_time) / self.anim_duration
+        if t >= 1.0:
+            t = 1.0
+            self.animating = False
+        # Smooth ease-in-out
+        t = t * t * (3.0 - 2.0 * t)
+        # Interpolate zoom exponentially for smooth feel
+        log_start = math.log(self.anim_start_zoom)
+        log_target = math.log(self.anim_target_zoom)
+        self.zoom = math.exp(log_start + (log_target - log_start) * t)
+        # Couple center to zoom so the target point stays fixed on screen
+        zoom_ratio = Decimal(self.anim_start_zoom / self.zoom)
+        self.center_x = self.anim_target_cx - (self.anim_target_cx - self.anim_start_cx) * zoom_ratio
+        self.center_y = self.anim_target_cy - (self.anim_target_cy - self.anim_start_cy) * zoom_ratio
+        self._auto_iter()
+        self.needs_compute = True
+
+    def _handle_rotate(self, pos):
+        dx = pos[0] - self.rotate_start[0]
+        self.rotation = self.rotate_angle_start + dx * 0.005
         self.needs_compute = True
 
     def _handle_zoom(self, scroll_y):
@@ -1193,6 +1309,7 @@ class MandelbrotViewer:
         try:
             while self.running:
                 self.handle_events()
+                self._update_animation()
 
                 if self.color_cycling:
                     self.color_offset += 0.005 * self.cycle_speed
