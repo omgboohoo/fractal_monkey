@@ -447,6 +447,10 @@ COL_TEXT = (220, 220, 230)
 COL_HEADING = (140, 160, 200)
 COL_ACCENT = (100, 180, 255)
 
+MINIMAP_MAX_W = 192
+MINIMAP_MARGIN = 10
+MINIMAP_BORDER = (100, 180, 255, 180)
+
 
 class MandelbrotViewer:
     """Real-time GPU-accelerated Mandelbrot set viewer."""
@@ -482,6 +486,7 @@ class MandelbrotViewer:
         self.last_click_time = 0.0
         self.last_click_pos = (0, 0)
         self.slider_dragging = False
+        self.color_slider_dragging = False
 
         # Smooth zoom animation
         self.animating = False
@@ -499,6 +504,10 @@ class MandelbrotViewer:
         self.needs_colorize = True  # rerun colorize kernel
         self.running = True
         self.panel_visible = True
+        self.minimap_visible = True
+        self.minimap_fractal_type = -1
+        self.minimap_palette_id = -1
+        self.minimap_color_offset = float('nan')
 
         # FPS tracking
         self.frame_times = deque(maxlen=30)
@@ -517,6 +526,7 @@ class MandelbrotViewer:
 
         self._init_pygame()
         self._init_cuda()
+        self._alloc_minimap_buffers()
         self._build_buttons()
 
     def _update_render_area(self):
@@ -562,6 +572,18 @@ class MandelbrotViewer:
         # Float buffer for cached smooth iteration counts
         iter_bytes = self.render_w * self.render_h * np.dtype(np.float32).itemsize
         self.gpu_iter = cuda.mem_alloc(iter_bytes)
+
+    def _alloc_minimap_buffers(self):
+        aspect = self.render_w / self.render_h
+        self.mm_w = MINIMAP_MAX_W
+        self.mm_h = max(16, int(MINIMAP_MAX_W / aspect))
+        mm_pixels = self.mm_w * self.mm_h
+        self.mm_gpu_iter = cuda.mem_alloc(mm_pixels * np.dtype(np.float32).itemsize)
+        self.mm_gpu_rgb = cuda.mem_alloc(mm_pixels * 3)
+        self.mm_host_buf = np.zeros((self.mm_h, self.mm_w, 3), dtype=np.uint8)
+        self.mm_surface = pygame.Surface((self.mm_w, self.mm_h))
+        # Force recompute on next draw
+        self.minimap_fractal_type = -1
 
     # ── UI button layout ──────────────────────────────────────
 
@@ -610,6 +632,12 @@ class MandelbrotViewer:
         self._speed_label_y = y
         y += 20
 
+        # Color offset slider
+        self._color_slider_y = y
+        self._color_slider_x = px
+        self._color_slider_w = bw
+        y += 28
+
         # Save / Load
         y += SECTION_GAP + 4
         self.buttons.append((pygame.Rect(px, y, hw, BTN_H), "Save", "save"))
@@ -629,6 +657,17 @@ class MandelbrotViewer:
         if not self.panel_visible:
             return False
         return x >= self.width - PANEL_W and y <= self._panel_h
+
+    def _point_in_color_slider(self, x, y):
+        if not self.panel_visible:
+            return False
+        cs_track_y = self._color_slider_y + 16
+        return (self._color_slider_x <= x <= self._color_slider_x + self._color_slider_w
+                and abs(y - cs_track_y) < 10)
+
+    def _color_slider_x_to_offset(self, mx):
+        t = max(0.0, min(1.0, (mx - self._color_slider_x) / self._color_slider_w))
+        return t
 
     def _point_in_slider(self, x, y):
         return y >= self.height - SLIDER_H
@@ -713,6 +752,7 @@ class MandelbrotViewer:
         self._update_render_area()
         self.surface = pygame.Surface((self.render_w, self.render_h))
         self._alloc_gpu_buffers()
+        self._alloc_minimap_buffers()
         self.needs_compute = True
         self.save_res_idx = 0
 
@@ -1046,6 +1086,30 @@ class MandelbrotViewer:
         self.screen.blit(self.font.render(f"Speed: {self.cycle_speed:.2f}x", True, COL_TEXT),
                          (panel_x + PANEL_PAD, self._speed_label_y))
 
+        # Color offset slider
+        cs_x = self._color_slider_x
+        cs_w = self._color_slider_w
+        cs_y = self._color_slider_y
+        cs_label_y = cs_y + 1
+        cs_track_y = cs_y + 16
+
+        self.screen.blit(self.font.render(f"Offset: {self.color_offset:.3f}", True, COL_TEXT),
+                         (cs_x, cs_label_y))
+        pygame.draw.line(self.screen, (60, 60, 80), (cs_x, cs_track_y), (cs_x + cs_w, cs_track_y), 2)
+
+        t = self.color_offset % 1.0
+        if t < 0:
+            t += 1.0
+        thumb_x = int(cs_x + t * cs_w)
+        pygame.draw.line(self.screen, COL_ACCENT, (cs_x, cs_track_y), (thumb_x, cs_track_y), 2)
+
+        cs_thumb_r = 6
+        cs_hovering = (abs(mx - thumb_x) < cs_thumb_r + 4
+                       and abs(my - cs_track_y) < 10)
+        cs_thumb_col = (140, 200, 255) if cs_hovering or self.color_slider_dragging else COL_ACCENT
+        pygame.draw.circle(self.screen, cs_thumb_col, (thumb_x, cs_track_y), cs_thumb_r)
+        pygame.draw.circle(self.screen, (200, 220, 255), (thumb_x, cs_track_y), cs_thumb_r, 1)
+
         # Section: SAVE / LOAD
         sec_y = self.buttons[9][0].y - 18
         self.screen.blit(self.font_head.render("SAVE / LOAD", True, COL_HEADING), (panel_x + PANEL_PAD, sec_y))
@@ -1104,6 +1168,171 @@ class MandelbrotViewer:
         label = f"Iter: {self.max_iter}  (offset {self.iter_offset:+d})"
         txt = self.font.render(label, True, COL_TEXT)
         self.screen.blit(txt, (track_x, bar_y + 2))
+
+    # ── Minimap ───────────────────────────────────────────────
+
+    def _render_minimap(self):
+        """Compute and/or colorize the minimap fractal on GPU."""
+        need_compute = (self.fractal_type != self.minimap_fractal_type)
+        need_colorize = (need_compute
+                         or self.palette_id != self.minimap_palette_id
+                         or self.color_offset != self.minimap_color_offset)
+
+        if not need_colorize:
+            return
+
+        grid_x = math.ceil(self.mm_w / BLOCK_SIZE[0])
+        grid_y = math.ceil(self.mm_h / BLOCK_SIZE[1])
+        grid = (grid_x, grid_y, 1)
+
+        if need_compute:
+            defaults = FRACTAL_DEFAULTS[self.fractal_type]
+            mm_cx = float(Decimal(defaults[0]))
+            mm_cy = float(Decimal(defaults[1]))
+            mm_zoom = defaults[2]
+            ftype = FRACTAL_TYPES[self.fractal_type][1]
+            mm_max_iter = max(200, int(200 + 100 * math.log10(max(mm_zoom, 1.0))))
+
+            self.k_compute_fast(
+                self.mm_gpu_iter,
+                np.int32(self.mm_w), np.int32(self.mm_h),
+                np.float64(mm_cx), np.float64(mm_cy),
+                np.float64(mm_zoom),
+                np.int32(mm_max_iter),
+                np.int32(ftype),
+                np.float64(1.0), np.float64(0.0),  # no rotation
+                block=BLOCK_SIZE, grid=grid,
+            )
+            self.minimap_fractal_type = self.fractal_type
+
+        self.k_colorize(
+            self.mm_gpu_rgb,
+            self.mm_gpu_iter,
+            np.int32(self.mm_w), np.int32(self.mm_h),
+            np.float64(self.color_offset),
+            np.int32(self.palette_id),
+            block=BLOCK_SIZE, grid=grid,
+        )
+        self.minimap_palette_id = self.palette_id
+        self.minimap_color_offset = self.color_offset
+
+        cuda.memcpy_dtoh(self.mm_host_buf, self.mm_gpu_rgb)
+        pygame.surfarray.blit_array(self.mm_surface, np.transpose(self.mm_host_buf, (1, 0, 2)))
+
+    def draw_minimap(self):
+        """Draw the minimap overlay with viewport indicator."""
+        if not self.minimap_visible:
+            return
+
+        self._render_minimap()
+
+        mm_x = MINIMAP_MARGIN
+        mm_y = self.height - SLIDER_H - self.mm_h - MINIMAP_MARGIN
+
+        # Semi-transparent background
+        bg = pygame.Surface((self.mm_w + 4, self.mm_h + 4), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 160))
+        self.screen.blit(bg, (mm_x - 2, mm_y - 2))
+
+        # Blit minimap surface
+        self.screen.blit(self.mm_surface, (mm_x, mm_y))
+
+        # Border
+        pygame.draw.rect(self.screen, MINIMAP_BORDER[:3],
+                         (mm_x - 1, mm_y - 1, self.mm_w + 2, self.mm_h + 2), 1)
+
+        # Viewport indicator
+        self._draw_minimap_viewport(mm_x, mm_y)
+
+        # Store position for hit testing
+        self._mm_screen_x = mm_x
+        self._mm_screen_y = mm_y
+
+    def _draw_minimap_viewport(self, mm_x, mm_y):
+        """Draw the viewport rectangle/crosshair on the minimap."""
+        defaults = FRACTAL_DEFAULTS[self.fractal_type]
+        mm_cx = float(Decimal(defaults[0]))
+        mm_cy = float(Decimal(defaults[1]))
+        mm_zoom = defaults[2]
+        mm_aspect = self.mm_w / self.mm_h
+
+        # Convert the 4 corners of the main viewport to fractal coords,
+        # then project onto minimap pixel coords
+        corners_px = [
+            (self.render_x, self.render_y),
+            (self.render_x + self.render_w, self.render_y),
+            (self.render_x + self.render_w, self.render_y + self.render_h),
+            (self.render_x, self.render_y + self.render_h),
+        ]
+
+        mm_points = []
+        for cpx, cpy in corners_px:
+            fx, fy = self._pixel_to_fractal(cpx, cpy)
+            fx = float(fx)
+            fy = float(fy)
+            # Fractal coord -> minimap pixel (no rotation on minimap)
+            raw_x = (fx - mm_cx) * mm_zoom / mm_aspect
+            raw_y = (fy - mm_cy) * mm_zoom
+            px = (raw_x + 0.5) * self.mm_w
+            py = (raw_y + 0.5) * self.mm_h
+            mm_points.append((mm_x + px, mm_y + py))
+
+        # Check if viewport rect is large enough to draw as polygon
+        min_x = min(p[0] for p in mm_points)
+        max_x = max(p[0] for p in mm_points)
+        min_y = min(p[1] for p in mm_points)
+        max_y = max(p[1] for p in mm_points)
+        rect_w = max_x - min_x
+        rect_h = max_y - min_y
+
+        if rect_w > 3 or rect_h > 3:
+            # Draw as polygon (handles rotation)
+            # Clamp to reasonable bounds to avoid huge rects
+            clamped = []
+            for px, py in mm_points:
+                cx = max(mm_x - 20, min(mm_x + self.mm_w + 20, px))
+                cy = max(mm_y - 20, min(mm_y + self.mm_h + 20, py))
+                clamped.append((cx, cy))
+            pygame.draw.polygon(self.screen, (100, 180, 255), clamped, 2)
+        else:
+            # Draw crosshair at center
+            center_fx, center_fy = float(self.center_x), float(self.center_y)
+            raw_x = (center_fx - mm_cx) * mm_zoom / mm_aspect
+            raw_y = (center_fy - mm_cy) * mm_zoom
+            cx = mm_x + (raw_x + 0.5) * self.mm_w
+            cy = mm_y + (raw_y + 0.5) * self.mm_h
+            cx = int(cx)
+            cy = int(cy)
+            cross_size = 6
+            col = (100, 180, 255)
+            pygame.draw.line(self.screen, col, (cx - cross_size, cy), (cx + cross_size, cy), 1)
+            pygame.draw.line(self.screen, col, (cx, cy - cross_size), (cx, cy + cross_size), 1)
+            pygame.draw.circle(self.screen, col, (cx, cy), 3, 1)
+
+    def _point_in_minimap(self, x, y):
+        """Hit test for minimap area."""
+        if not self.minimap_visible:
+            return False
+        mm_x = MINIMAP_MARGIN
+        mm_y = self.height - SLIDER_H - self.mm_h - MINIMAP_MARGIN
+        return (mm_x <= x <= mm_x + self.mm_w and mm_y <= y <= mm_y + self.mm_h)
+
+    def _handle_minimap_click(self, pos):
+        """Navigate to the clicked position on the minimap."""
+        mm_x = MINIMAP_MARGIN
+        mm_y = self.height - SLIDER_H - self.mm_h - MINIMAP_MARGIN
+
+        defaults = FRACTAL_DEFAULTS[self.fractal_type]
+        mm_cx = float(Decimal(defaults[0]))
+        mm_cy = float(Decimal(defaults[1]))
+        mm_zoom = defaults[2]
+        mm_aspect = self.mm_w / self.mm_h
+
+        fx = mm_cx + ((pos[0] - mm_x) / self.mm_w - 0.5) * mm_aspect / mm_zoom
+        fy = mm_cy + ((pos[1] - mm_y) / self.mm_h - 0.5) / mm_zoom
+        self.center_x = Decimal(str(fx))
+        self.center_y = Decimal(str(fy))
+        self.needs_compute = True
 
     # ── Modal dialogs ──────────────────────────────────────────
 
@@ -1296,11 +1525,19 @@ class MandelbrotViewer:
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
+                    if self._point_in_minimap(*event.pos):
+                        self._handle_minimap_click(event.pos)
+                        continue
                     if self._point_in_slider(*event.pos):
                         self.slider_dragging = True
                         self.iter_offset = self._slider_x_to_offset(event.pos[0])
                         self._auto_iter()
                         self.needs_compute = True
+                        continue
+                    if self._point_in_color_slider(*event.pos):
+                        self.color_slider_dragging = True
+                        self.color_offset = self._color_slider_x_to_offset(event.pos[0])
+                        self.needs_colorize = True
                         continue
                     if self._handle_panel_click(event.pos):
                         continue
@@ -1325,12 +1562,16 @@ class MandelbrotViewer:
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     self.slider_dragging = False
+                    self.color_slider_dragging = False
                     self.dragging = False
                 elif event.button == 3:
                     self.rotating = False
 
             elif event.type == pygame.MOUSEMOTION:
-                if self.slider_dragging:
+                if self.color_slider_dragging:
+                    self.color_offset = self._color_slider_x_to_offset(event.pos[0])
+                    self.needs_colorize = True
+                elif self.slider_dragging:
                     self.iter_offset = self._slider_x_to_offset(event.pos[0])
                     self._auto_iter()
                     self.needs_compute = True
@@ -1470,6 +1711,8 @@ class MandelbrotViewer:
                 self.load_hover = -1
         elif event.key == pygame.K_a:
             self._do_action("aspect_next")
+        elif event.key == pygame.K_m:
+            self.minimap_visible = not self.minimap_visible
         elif event.key == pygame.K_r:
             self._do_action("reset")
 
@@ -1547,6 +1790,7 @@ class MandelbrotViewer:
         self._update_render_area()
         self.surface = pygame.Surface((self.render_w, self.render_h))
         self._alloc_gpu_buffers()
+        self._alloc_minimap_buffers()
         self._build_buttons()
         self.needs_compute = True
 
@@ -1578,6 +1822,7 @@ class MandelbrotViewer:
                 self.screen.fill((0, 0, 0))
                 self.screen.blit(self.surface, (self.render_x, self.render_y))
                 self.draw_overlay()
+                self.draw_minimap()
                 self.draw_panel()
                 self.draw_slider()
                 self.draw_modal()
