@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU-Accelerated Mandelbrot Fractal Viewer using Pygame + PyCUDA.
+"""Fractal Monkey — GPU-Accelerated Fractal Viewer using Pygame + PyCUDA.
 
 Two-pass rendering:
   1. Compute pass — expensive iteration, writes smooth iter values to a float buffer.
@@ -452,8 +452,8 @@ MINIMAP_MARGIN = 10
 MINIMAP_BORDER = (100, 180, 255, 180)
 
 
-class MandelbrotViewer:
-    """Real-time GPU-accelerated Mandelbrot set viewer."""
+class FractalMonkey:
+    """Real-time GPU-accelerated fractal viewer."""
 
     def __init__(self, width=1280, height=720):
         self.width = width
@@ -552,7 +552,7 @@ class MandelbrotViewer:
         self.screen = pygame.display.set_mode(
             (self.width, self.height), pygame.RESIZABLE
         )
-        pygame.display.set_caption("Mandelbrot Fractal Viewer (GPU)")
+        pygame.display.set_caption("Fractal Monkey")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("monospace", 13)
         self.font_head = pygame.font.SysFont("monospace", 13, bold=True)
@@ -1835,7 +1835,7 @@ class MandelbrotViewer:
 
 
 def main():
-    viewer = MandelbrotViewer()
+    viewer = FractalMonkey()
     viewer.run()
 
 

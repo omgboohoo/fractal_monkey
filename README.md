@@ -1,4 +1,4 @@
-# GPU Fractal Viewer
+# Fractal Monkey
 
 Real-time GPU-accelerated fractal explorer using PyCUDA and Pygame. Renders 11 different fractal types with interactive pan, zoom, color cycling, 8 color palettes, and save/load for your favorite locations.
 
