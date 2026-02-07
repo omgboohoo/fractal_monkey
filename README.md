@@ -25,7 +25,8 @@ Real-time GPU-accelerated fractal explorer using PyCUDA and Pygame. Renders 11 d
 - Save/load locations with custom names (stored as JSON in `locations/` folder)
 - Save high-res images with selectable resolution presets per aspect ratio
 - 8 aspect ratios (16:9, 21:9, 32:9, 48:9, 4:3, 1:1, 3:2, 16:10) with letterboxed preview
-- Color cycling with adjustable speed
+- Color cycling with adjustable speed + manual offset slider
+- Minimap overview with viewport indicator and click-to-navigate
 - View rotation (right-click drag)
 - Double-click smooth zoom into any point
 - Resizable window
@@ -39,8 +40,14 @@ Real-time GPU-accelerated fractal explorer using PyCUDA and Pygame. Renders 11 d
 
 ## Quick Start
 
+**Linux / macOS:**
 ```bash
 ./run.sh
+```
+
+**Windows:**
+```bat
+run.bat
 ```
 
 Or manually:
@@ -68,6 +75,7 @@ python3 fractal_viewer.py
 | `S` | Save current location (opens name dialog) |
 | `L` | Load a saved location (opens list) |
 | `C` | Toggle color cycling |
+| `M` | Toggle minimap |
 | `R` | Reset to default view |
 | `Tab` | Show / hide control panel |
 | `Esc` | Quit |
@@ -87,6 +95,14 @@ Saves are stored as JSON files in the `locations/` folder next to the script.
 Press **Save Image** in the panel to render a high-resolution PNG. The dialog lets you pick a filename and cycle through resolution presets with Left/Right arrow keys (or the `< >` buttons). Available resolutions depend on the current aspect ratio — for example, 16:9 offers 1920x1080 up to 7680x4320, while 48:9 offers 5760x1080 up to 11520x2160.
 
 Images are saved to the `images/` folder next to the script.
+
+## Minimap
+
+A minimap in the bottom-left corner shows a zoomed-out overview of the current fractal. A viewport indicator tracks your position, zoom level, and rotation — useful for staying oriented during deep zooms up to 3.4x10^12x. Click anywhere on the minimap to navigate directly to that location. Press `M` to toggle it on or off.
+
+## Color Offset
+
+The **Offset** slider in the color cycle section lets you manually shift the color palette to find the look you want. Drag the slider to smoothly rotate through the palette. This works independently of color cycling — use cycling for animation, the slider for fine-tuning.
 
 ## Aspect Ratio
 
