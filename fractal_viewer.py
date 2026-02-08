@@ -59,6 +59,7 @@ FRACTAL_TYPES = [
     ("Multibrot z^3", 8),
     ("Multibrot z^4", 9),
     ("Phoenix", 10),
+    ("3D Mandelbulb", 11),
 ]
 
 # Aspect ratios: (name, width_ratio, height_ratio)
@@ -98,6 +99,7 @@ FRACTAL_DEFAULTS = {
     8: ("0.10629497003968257195600202755845435177255299165414", "0.016411609457671956526630818772511962720872176101914", 0.4039936115143565, 50),
     9: ("0.14631660180555559192148422729312915470768486330834", "0.013644879965277797322876377459160706452458002140234", 0.4143524220660067, 50),
     10: ("0.09215930357142862058936394227472728376637419787360", "0.00432279067460318581569185286353633229477135238307", 0.41435242206600664, 50),
+    11: ("0.0", "0.0", 0.35, 0),  # 3D Mandelbulb (dummy 2D values; uses 3D camera)
 }
 
 CUDA_KERNEL = r"""
@@ -424,6 +426,199 @@ __global__ void colorize(
         output[idx + 2] = (unsigned char)(b * 255.0);
     }
 }
+
+// ============================================================
+// 3D Mandelbulb — ray marching with distance estimation
+// ============================================================
+
+__device__ float mandelbulb_DE(float x, float y, float z, float power, int max_iter, float *trap_out) {
+    float dr = 1.0f;
+    float r = 0.0f;
+    float ox = x, oy = y, oz = z;
+    float trap = 1e20f;
+
+    for (int i = 0; i < max_iter; i++) {
+        r = sqrtf(x*x + y*y + z*z);
+        if (r > 4.0f) break;
+
+        trap = fminf(trap, r);
+
+        // Convert to spherical
+        float theta = acosf(z / r);
+        float phi = atan2f(y, x);
+        float rn = powf(r, power);
+        dr = powf(r, power - 1.0f) * power * dr + 1.0f;
+
+        // Scale and rotate the point
+        float new_theta = theta * power;
+        float new_phi = phi * power;
+        x = ox + rn * sinf(new_theta) * cosf(new_phi);
+        y = oy + rn * sinf(new_theta) * sinf(new_phi);
+        z = oz + rn * cosf(new_theta);
+    }
+    trap_out[0] = trap;
+    return 0.5f * logf(r) * r / dr;
+}
+
+__device__ void mandelbulb_normal(float x, float y, float z, float power, int max_iter,
+                                   float *nx, float *ny, float *nz) {
+    float eps = 0.0005f;
+    float trap;
+    float d  = mandelbulb_DE(x, y, z, power, max_iter, &trap);
+    float dx = mandelbulb_DE(x+eps, y, z, power, max_iter, &trap) - mandelbulb_DE(x-eps, y, z, power, max_iter, &trap);
+    float dy = mandelbulb_DE(x, y+eps, z, power, max_iter, &trap) - mandelbulb_DE(x, y-eps, z, power, max_iter, &trap);
+    float dz = mandelbulb_DE(x, y, z+eps, power, max_iter, &trap) - mandelbulb_DE(x, y, z-eps, power, max_iter, &trap);
+    float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (len < 1e-10f) len = 1e-10f;
+    *nx = dx / len;
+    *ny = dy / len;
+    *nz = dz / len;
+}
+
+__device__ float mandelbulb_AO(float px, float py, float pz,
+                                float nx_val, float ny_val, float nz_val,
+                                float power, int max_iter) {
+    float ao = 0.0f;
+    float scale = 1.0f;
+    for (int i = 1; i <= 5; i++) {
+        float dist = 0.02f * (float)i;
+        float trap;
+        float d = mandelbulb_DE(px + nx_val * dist, py + ny_val * dist, pz + nz_val * dist,
+                                 power, max_iter, &trap);
+        ao += (dist - d) * scale;
+        scale *= 0.5f;
+    }
+    return fmaxf(0.0f, 1.0f - 4.0f * ao);
+}
+
+__global__ void render_mandelbulb(
+    unsigned char *output,
+    int width, int height,
+    float eye_x, float eye_y, float eye_z,
+    float fwd_x, float fwd_y, float fwd_z,
+    float right_x, float right_y, float right_z,
+    float up_x, float up_y, float up_z,
+    float power, int max_iter, int max_steps,
+    double color_offset, int palette_id
+)
+{
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px >= width || py >= height) return;
+
+    float aspect = (float)width / (float)height;
+    float u = ((float)px / (float)width - 0.5f) * aspect;
+    float v = (0.5f - (float)py / (float)height);
+    float fov = 1.5f;
+
+    // Ray direction
+    float rd_x = fwd_x * fov + right_x * u + up_x * v;
+    float rd_y = fwd_y * fov + right_y * u + up_y * v;
+    float rd_z = fwd_z * fov + right_z * u + up_z * v;
+    float rd_len = sqrtf(rd_x*rd_x + rd_y*rd_y + rd_z*rd_z);
+    rd_x /= rd_len; rd_y /= rd_len; rd_z /= rd_len;
+
+    // Ray march
+    float t = 0.0f;
+    float min_dist = 1e20f;
+    float trap_val = 0.0f;
+    bool hit = false;
+
+    for (int i = 0; i < max_steps; i++) {
+        float rx = eye_x + rd_x * t;
+        float ry = eye_y + rd_y * t;
+        float rz = eye_z + rd_z * t;
+
+        float trap;
+        float d = mandelbulb_DE(rx, ry, rz, power, max_iter, &trap);
+        if (d < min_dist) min_dist = d;
+
+        if (d < 0.0005f) {
+            hit = true;
+            trap_val = trap;
+            break;
+        }
+        if (t > 20.0f) break;
+        t += d;
+    }
+
+    int idx = (py * width + px) * 3;
+
+    if (hit) {
+        float hx = eye_x + rd_x * t;
+        float hy = eye_y + rd_y * t;
+        float hz = eye_z + rd_z * t;
+
+        // Surface normal
+        float nx_val, ny_val, nz_val;
+        mandelbulb_normal(hx, hy, hz, power, max_iter, &nx_val, &ny_val, &nz_val);
+
+        // Ambient occlusion
+        float ao = mandelbulb_AO(hx, hy, hz, nx_val, ny_val, nz_val, power, max_iter);
+
+        // Key light (upper-right-front)
+        float l1x = 0.577f, l1y = 0.577f, l1z = 0.577f;
+        float diff1 = fmaxf(0.0f, nx_val*l1x + ny_val*l1y + nz_val*l1z);
+
+        // Fill light (left-lower)
+        float l2x = -0.707f, l2y = -0.5f, l2z = 0.5f;
+        float l2_len = sqrtf(l2x*l2x + l2y*l2y + l2z*l2z);
+        l2x /= l2_len; l2y /= l2_len; l2z /= l2_len;
+        float diff2 = fmaxf(0.0f, nx_val*l2x + ny_val*l2y + nz_val*l2z);
+
+        // Blinn-Phong specular (key light)
+        float hx_bp = l1x - rd_x;
+        float hy_bp = l1y - rd_y;
+        float hz_bp = l1z - rd_z;
+        float h_len = sqrtf(hx_bp*hx_bp + hy_bp*hy_bp + hz_bp*hz_bp);
+        hx_bp /= h_len; hy_bp /= h_len; hz_bp /= h_len;
+        float spec = powf(fmaxf(0.0f, nx_val*hx_bp + ny_val*hy_bp + nz_val*hz_bp), 32.0f);
+
+        // Surface color from palette
+        double col_t = (double)trap_val * 2.0 + color_offset;
+        double pr, pg, pb;
+        get_palette_color(col_t, palette_id, &pr, &pg, &pb);
+        float sr = (float)pr;
+        float sg = (float)pg;
+        float sb = (float)pb;
+
+        // Combine lighting
+        float ambient = 0.15f;
+        float r = sr * (ambient + 0.7f * diff1 + 0.25f * diff2) * ao + 0.4f * spec;
+        float g = sg * (ambient + 0.7f * diff1 + 0.25f * diff2) * ao + 0.4f * spec;
+        float b = sb * (ambient + 0.7f * diff1 + 0.25f * diff2) * ao + 0.4f * spec;
+
+        // Distance fog
+        float fog = expf(-0.08f * t * t);
+        r = r * fog + (1.0f - fog) * 0.02f;
+        g = g * fog + (1.0f - fog) * 0.02f;
+        b = b * fog + (1.0f - fog) * 0.03f;
+
+        // Gamma correction
+        r = powf(fminf(fmaxf(r, 0.0f), 1.0f), 0.4545f);
+        g = powf(fminf(fmaxf(g, 0.0f), 1.0f), 0.4545f);
+        b = powf(fminf(fmaxf(b, 0.0f), 1.0f), 0.4545f);
+
+        output[idx]     = (unsigned char)(r * 255.0f);
+        output[idx + 1] = (unsigned char)(g * 255.0f);
+        output[idx + 2] = (unsigned char)(b * 255.0f);
+    } else {
+        // Dark gradient background
+        float gy = 0.5f - (float)py / (float)height;
+        float bg = 0.02f + 0.03f * fmaxf(0.0f, gy);
+        // Subtle glow near the object
+        float glow = 0.0f;
+        if (min_dist < 0.5f) {
+            glow = 0.03f * expf(-10.0f * min_dist);
+        }
+        float r = bg + glow * 0.3f;
+        float g = bg + glow * 0.5f;
+        float b = bg + glow * 0.8f;
+        output[idx]     = (unsigned char)(fminf(r, 1.0f) * 255.0f);
+        output[idx + 1] = (unsigned char)(fminf(g, 1.0f) * 255.0f);
+        output[idx + 2] = (unsigned char)(fminf(b, 1.0f) * 255.0f);
+    }
+}
 """
 
 BLOCK_SIZE = (16, 16, 1)
@@ -509,6 +704,19 @@ class FractalMonkey:
         self.minimap_palette_id = -1
         self.minimap_color_offset = float('nan')
 
+        # 3D Mandelbulb camera state
+        self.cam_azimuth = 0.4
+        self.cam_elevation = 0.3
+        self.cam_distance = 3.5
+        self.cam_target = (0.0, 0.0, 0.0)
+        self.mandelbulb_power = 8.0
+        self.mandelbulb_max_iter = 12
+        self.mandelbulb_max_steps = 200
+        self.orbit_dragging = False
+        self.orbit_drag_start = (0, 0)
+        self.orbit_azimuth_start = 0.0
+        self.orbit_elevation_start = 0.0
+
         # FPS tracking
         self.frame_times = deque(maxlen=30)
         self.last_frame_time = time.perf_counter()
@@ -564,6 +772,7 @@ class FractalMonkey:
         self.k_compute_fast = self.module.get_function("compute_fast")
         self.k_compute_deep = self.module.get_function("compute_deep")
         self.k_colorize = self.module.get_function("colorize")
+        self.k_render_mandelbulb = self.module.get_function("render_mandelbulb")
         self._alloc_gpu_buffers()
 
     def _alloc_gpu_buffers(self):
@@ -695,10 +904,16 @@ class FractalMonkey:
             self._reset_view_for_fractal()
         elif action == "palette_prev":
             self.palette_id = (self.palette_id - 1) % len(PALETTE_NAMES)
-            self.needs_colorize = True
+            if self._is_3d_mode():
+                self.needs_compute = True
+            else:
+                self.needs_colorize = True
         elif action == "palette_next":
             self.palette_id = (self.palette_id + 1) % len(PALETTE_NAMES)
-            self.needs_colorize = True
+            if self._is_3d_mode():
+                self.needs_compute = True
+            else:
+                self.needs_colorize = True
         elif action == "aspect_prev":
             self.aspect_id = (self.aspect_id - 1) % len(ASPECT_RATIOS)
             self._apply_aspect_ratio()
@@ -738,6 +953,16 @@ class FractalMonkey:
 
     def _reset_view_for_fractal(self):
         """Reset center, zoom, iterations, and rotation to defaults for the current fractal type."""
+        if self._is_3d_mode():
+            self.cam_azimuth = 0.4
+            self.cam_elevation = 0.3
+            self.cam_distance = 3.5
+            self.cam_target = (0.0, 0.0, 0.0)
+            self.mandelbulb_power = 8.0
+            self.mandelbulb_max_iter = 12
+            self.mandelbulb_max_steps = 200
+            self.needs_compute = True
+            return
         cx, cy, zoom, iter_off = FRACTAL_DEFAULTS[self.fractal_type]
         self.center_x = Decimal(cx)
         self.center_y = Decimal(cy)
@@ -795,6 +1020,13 @@ class FractalMonkey:
             "fractal_type": self.fractal_type,
             "rotation": self.rotation,
             "aspect_id": self.aspect_id,
+            "cam_azimuth": self.cam_azimuth,
+            "cam_elevation": self.cam_elevation,
+            "cam_distance": self.cam_distance,
+            "cam_target": list(self.cam_target),
+            "mandelbulb_power": self.mandelbulb_power,
+            "mandelbulb_max_iter": self.mandelbulb_max_iter,
+            "mandelbulb_max_steps": self.mandelbulb_max_steps,
         }
         filepath = os.path.join(LOCATIONS_DIR, filename)
         with open(filepath, "w") as f:
@@ -821,6 +1053,14 @@ class FractalMonkey:
         self.fractal_type = data.get("fractal_type", 0)
         self.rotation = data.get("rotation", 0.0)
         self.aspect_id = data.get("aspect_id", 0)
+        self.cam_azimuth = data.get("cam_azimuth", 0.4)
+        self.cam_elevation = data.get("cam_elevation", 0.3)
+        self.cam_distance = data.get("cam_distance", 3.5)
+        ct = data.get("cam_target", [0.0, 0.0, 0.0])
+        self.cam_target = tuple(ct)
+        self.mandelbulb_power = data.get("mandelbulb_power", 8.0)
+        self.mandelbulb_max_iter = data.get("mandelbulb_max_iter", 12)
+        self.mandelbulb_max_steps = data.get("mandelbulb_max_steps", 200)
         self._apply_aspect_ratio()
         self._auto_iter()
         self.needs_compute = True
@@ -858,6 +1098,30 @@ class FractalMonkey:
         grid_x = math.ceil(img_w / BLOCK_SIZE[0])
         grid_y = math.ceil(img_h / BLOCK_SIZE[1])
         grid = (grid_x, grid_y, 1)
+
+        if self._is_3d_mode():
+            cam = self._compute_3d_camera()
+            self.k_render_mandelbulb(
+                gpu_rgb_img,
+                np.int32(img_w), np.int32(img_h),
+                np.float32(cam[0]), np.float32(cam[1]), np.float32(cam[2]),
+                np.float32(cam[3]), np.float32(cam[4]), np.float32(cam[5]),
+                np.float32(cam[6]), np.float32(cam[7]), np.float32(cam[8]),
+                np.float32(cam[9]), np.float32(cam[10]), np.float32(cam[11]),
+                np.float32(self.mandelbulb_power),
+                np.int32(self.mandelbulb_max_iter),
+                np.int32(self.mandelbulb_max_steps),
+                np.float64(self.color_offset),
+                np.int32(self.palette_id),
+                block=BLOCK_SIZE, grid=grid,
+            )
+            cuda.memcpy_dtoh(img_buf, gpu_rgb_img)
+            img_surface = pygame.Surface((img_w, img_h))
+            pygame.surfarray.blit_array(img_surface, np.transpose(img_buf, (1, 0, 2)))
+            pygame.image.save(img_surface, filepath)
+            gpu_rgb_img.free()
+            gpu_iter_img.free()
+            return
 
         rc = math.cos(self.rotation)
         rs = math.sin(self.rotation)
@@ -933,6 +1197,41 @@ class FractalMonkey:
             int(self.base_iter + 100 * math.log10(max(self.zoom, 1.0))) + self.iter_offset,
         )
 
+    def _is_3d_mode(self):
+        return self.fractal_type == 11
+
+    def _compute_3d_camera(self):
+        """Convert azimuth/elevation/distance to eye, forward, right, up vectors."""
+        az = self.cam_azimuth
+        el = self.cam_elevation
+        dist = self.cam_distance
+        tx, ty, tz = self.cam_target
+        eye_x = tx + dist * math.cos(el) * math.sin(az)
+        eye_y = ty + dist * math.sin(el)
+        eye_z = tz + dist * math.cos(el) * math.cos(az)
+        fwd_x = tx - eye_x
+        fwd_y = ty - eye_y
+        fwd_z = tz - eye_z
+        fwd_len = math.sqrt(fwd_x**2 + fwd_y**2 + fwd_z**2)
+        fwd_x /= fwd_len; fwd_y /= fwd_len; fwd_z /= fwd_len
+        # World up
+        wu_x, wu_y, wu_z = 0.0, 1.0, 0.0
+        # Right = fwd x up
+        right_x = fwd_y * wu_z - fwd_z * wu_y
+        right_y = fwd_z * wu_x - fwd_x * wu_z
+        right_z = fwd_x * wu_y - fwd_y * wu_x
+        r_len = math.sqrt(right_x**2 + right_y**2 + right_z**2)
+        if r_len < 1e-10:
+            right_x, right_y, right_z = 1.0, 0.0, 0.0
+        else:
+            right_x /= r_len; right_y /= r_len; right_z /= r_len
+        # Up = right x fwd
+        up_x = right_y * fwd_z - right_z * fwd_y
+        up_y = right_z * fwd_x - right_x * fwd_z
+        up_z = right_x * fwd_y - right_y * fwd_x
+        return (eye_x, eye_y, eye_z, fwd_x, fwd_y, fwd_z,
+                right_x, right_y, right_z, up_x, up_y, up_z)
+
     # ── GPU two-pass render ───────────────────────────────────
 
     def _run_compute(self):
@@ -940,6 +1239,24 @@ class FractalMonkey:
         grid_x = math.ceil(self.render_w / BLOCK_SIZE[0])
         grid_y = math.ceil(self.render_h / BLOCK_SIZE[1])
         grid = (grid_x, grid_y, 1)
+
+        if self._is_3d_mode():
+            cam = self._compute_3d_camera()
+            self.k_render_mandelbulb(
+                self.gpu_rgb,
+                np.int32(self.render_w), np.int32(self.render_h),
+                np.float32(cam[0]), np.float32(cam[1]), np.float32(cam[2]),
+                np.float32(cam[3]), np.float32(cam[4]), np.float32(cam[5]),
+                np.float32(cam[6]), np.float32(cam[7]), np.float32(cam[8]),
+                np.float32(cam[9]), np.float32(cam[10]), np.float32(cam[11]),
+                np.float32(self.mandelbulb_power),
+                np.int32(self.mandelbulb_max_iter),
+                np.int32(self.mandelbulb_max_steps),
+                np.float64(self.color_offset),
+                np.int32(self.palette_id),
+                block=BLOCK_SIZE, grid=grid,
+            )
+            return
 
         rc = math.cos(self.rotation)
         rs = math.sin(self.rotation)
@@ -987,7 +1304,17 @@ class FractalMonkey:
         )
 
     def render(self):
-        """Two-pass render: compute (if needed) then colorize."""
+        """Two-pass render: compute (if needed) then colorize. 3D mode is single-pass."""
+        if self._is_3d_mode():
+            if self.needs_compute or self.needs_colorize:
+                self._run_compute()
+                self.needs_compute = False
+                self.needs_colorize = False
+                cuda.memcpy_dtoh(self.host_buf, self.gpu_rgb)
+                arr = np.transpose(self.host_buf, (1, 0, 2))
+                pygame.surfarray.blit_array(self.surface, arr)
+            return
+
         if self.needs_compute:
             self._run_compute()
             self.needs_compute = False
@@ -1004,20 +1331,30 @@ class FractalMonkey:
     # ── HUD overlay (top-left info) ──────────────────────────
 
     def draw_overlay(self):
-        mx, my = pygame.mouse.get_pos()
-        mouse_fx, mouse_fy = self._pixel_to_fractal(mx, my)
-        mode = "deep" if self.zoom >= DD_ZOOM_THRESHOLD else "fast"
+        if self._is_3d_mode():
+            az_deg = math.degrees(self.cam_azimuth) % 360
+            el_deg = math.degrees(self.cam_elevation)
+            lines = [
+                f"Azimuth: {az_deg:.1f}\u00b0   Elevation: {el_deg:.1f}\u00b0",
+                f"Distance: {self.cam_distance:.2f}   Power: {self.mandelbulb_power:.1f}",
+                f"Iter: {self.mandelbulb_max_iter}   Steps: {self.mandelbulb_max_steps}",
+                f"FPS: {self.fps:.1f}",
+            ]
+        else:
+            mx, my = pygame.mouse.get_pos()
+            mouse_fx, mouse_fy = self._pixel_to_fractal(mx, my)
+            mode = "deep" if self.zoom >= DD_ZOOM_THRESHOLD else "fast"
 
-        rot_deg = math.degrees(self.rotation) % 360
-        lines = [
-            f"Center: ({float(self.center_x):.15g}, {float(self.center_y):.15g})",
-            f"Zoom: {self.zoom:.6e}   Kernel: {mode}   Rot: {rot_deg:.1f}\u00b0",
-            f"Mouse: ({float(mouse_fx):.15g}, {float(mouse_fy):.15g})",
-            f"FPS: {self.fps:.1f}",
-        ]
-        if self.zoom >= MAX_ZOOM * 0.01:
-            pct = min(100.0, self.zoom / MAX_ZOOM * 100)
-            lines.append(f"Precision: {100 - pct:.0f}% remaining" if pct < 100 else "PRECISION LIMIT")
+            rot_deg = math.degrees(self.rotation) % 360
+            lines = [
+                f"Center: ({float(self.center_x):.15g}, {float(self.center_y):.15g})",
+                f"Zoom: {self.zoom:.6e}   Kernel: {mode}   Rot: {rot_deg:.1f}\u00b0",
+                f"Mouse: ({float(mouse_fx):.15g}, {float(mouse_fy):.15g})",
+                f"FPS: {self.fps:.1f}",
+            ]
+            if self.zoom >= MAX_ZOOM * 0.01:
+                pct = min(100.0, self.zoom / MAX_ZOOM * 100)
+                lines.append(f"Precision: {100 - pct:.0f}% remaining" if pct < 100 else "PRECISION LIMIT")
 
         padding = 6
         lh = self.font.get_linesize()
@@ -1134,6 +1471,12 @@ class FractalMonkey:
 
     # ── Iteration slider (bottom bar) ─────────────────────────
 
+    def _slider_3d_x_to_iter(self, mx):
+        track_x = SLIDER_PAD
+        track_w = self.width - 2 * SLIDER_PAD
+        t = max(0.0, min(1.0, (mx - track_x) / track_w))
+        return int(4 + t * (24 - 4))
+
     def draw_slider(self):
         bar_y = self.height - SLIDER_H
         bar = pygame.Surface((self.width, SLIDER_H), pygame.SRCALPHA)
@@ -1147,11 +1490,18 @@ class FractalMonkey:
         # Track line
         pygame.draw.line(self.screen, (60, 60, 80), (track_x, track_y), (track_x + track_w, track_y), 2)
 
-        # Thumb position
-        iter_min = self._slider_min_offset()
-        rng = SLIDER_ITER_MAX - iter_min
-        t = max(0.0, min(1.0, (self.iter_offset - iter_min) / rng))
-        thumb_x = int(track_x + t * track_w)
+        if self._is_3d_mode():
+            # 3D mode: slider controls mandelbulb_max_iter (4-24)
+            t = max(0.0, min(1.0, (self.mandelbulb_max_iter - 4) / (24 - 4)))
+            thumb_x = int(track_x + t * track_w)
+            label = f"Mandelbulb Iter: {self.mandelbulb_max_iter}"
+        else:
+            # Thumb position
+            iter_min = self._slider_min_offset()
+            rng = SLIDER_ITER_MAX - iter_min
+            t = max(0.0, min(1.0, (self.iter_offset - iter_min) / rng))
+            thumb_x = int(track_x + t * track_w)
+            label = f"Iter: {self.max_iter}  (offset {self.iter_offset:+d})"
 
         # Filled portion
         pygame.draw.line(self.screen, COL_ACCENT, (track_x, track_y), (thumb_x, track_y), 2)
@@ -1165,7 +1515,6 @@ class FractalMonkey:
         pygame.draw.circle(self.screen, (200, 220, 255), (thumb_x, track_y), thumb_r, 1)
 
         # Label
-        label = f"Iter: {self.max_iter}  (offset {self.iter_offset:+d})"
         txt = self.font.render(label, True, COL_TEXT)
         self.screen.blit(txt, (track_x, bar_y + 2))
 
@@ -1173,6 +1522,8 @@ class FractalMonkey:
 
     def _render_minimap(self):
         """Compute and/or colorize the minimap fractal on GPU."""
+        if self._is_3d_mode():
+            return
         need_compute = (self.fractal_type != self.minimap_fractal_type)
         need_colorize = (need_compute
                          or self.palette_id != self.minimap_palette_id
@@ -1221,7 +1572,7 @@ class FractalMonkey:
 
     def draw_minimap(self):
         """Draw the minimap overlay with viewport indicator."""
-        if not self.minimap_visible:
+        if not self.minimap_visible or self._is_3d_mode():
             return
 
         self._render_minimap()
@@ -1525,55 +1876,85 @@ class FractalMonkey:
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
-                    if self._point_in_minimap(*event.pos):
+                    if not self._is_3d_mode() and self._point_in_minimap(*event.pos):
                         self._handle_minimap_click(event.pos)
                         continue
                     if self._point_in_slider(*event.pos):
                         self.slider_dragging = True
-                        self.iter_offset = self._slider_x_to_offset(event.pos[0])
-                        self._auto_iter()
-                        self.needs_compute = True
+                        if self._is_3d_mode():
+                            self.mandelbulb_max_iter = self._slider_3d_x_to_iter(event.pos[0])
+                            self.needs_compute = True
+                        else:
+                            self.iter_offset = self._slider_x_to_offset(event.pos[0])
+                            self._auto_iter()
+                            self.needs_compute = True
                         continue
                     if self._point_in_color_slider(*event.pos):
                         self.color_slider_dragging = True
                         self.color_offset = self._color_slider_x_to_offset(event.pos[0])
-                        self.needs_colorize = True
+                        if self._is_3d_mode():
+                            self.needs_compute = True
+                        else:
+                            self.needs_colorize = True
                         continue
                     if self._handle_panel_click(event.pos):
                         continue
-                    now = time.perf_counter()
-                    dx = abs(event.pos[0] - self.last_click_pos[0])
-                    dy = abs(event.pos[1] - self.last_click_pos[1])
-                    if now - self.last_click_time < 0.35 and dx < 10 and dy < 10:
-                        self._start_smooth_zoom(event.pos)
-                        self.last_click_time = 0.0
-                        continue
-                    self.last_click_time = now
-                    self.last_click_pos = event.pos
-                    self.animating = False
-                    self.dragging = True
-                    self.drag_start = event.pos
-                    self.drag_center_start = (self.center_x, self.center_y)
+                    if self._is_3d_mode():
+                        # Start orbit drag
+                        self.orbit_dragging = True
+                        self.orbit_drag_start = event.pos
+                        self.orbit_azimuth_start = self.cam_azimuth
+                        self.orbit_elevation_start = self.cam_elevation
+                    else:
+                        now = time.perf_counter()
+                        dx = abs(event.pos[0] - self.last_click_pos[0])
+                        dy = abs(event.pos[1] - self.last_click_pos[1])
+                        if now - self.last_click_time < 0.35 and dx < 10 and dy < 10:
+                            self._start_smooth_zoom(event.pos)
+                            self.last_click_time = 0.0
+                            continue
+                        self.last_click_time = now
+                        self.last_click_pos = event.pos
+                        self.animating = False
+                        self.dragging = True
+                        self.drag_start = event.pos
+                        self.drag_center_start = (self.center_x, self.center_y)
                 elif event.button == 3:
-                    self.rotating = True
-                    self.rotate_start = event.pos
-                    self.rotate_angle_start = self.rotation
+                    if not self._is_3d_mode():
+                        self.rotating = True
+                        self.rotate_start = event.pos
+                        self.rotate_angle_start = self.rotation
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     self.slider_dragging = False
                     self.color_slider_dragging = False
                     self.dragging = False
+                    self.orbit_dragging = False
                 elif event.button == 3:
                     self.rotating = False
 
             elif event.type == pygame.MOUSEMOTION:
                 if self.color_slider_dragging:
                     self.color_offset = self._color_slider_x_to_offset(event.pos[0])
-                    self.needs_colorize = True
+                    if self._is_3d_mode():
+                        self.needs_compute = True
+                    else:
+                        self.needs_colorize = True
                 elif self.slider_dragging:
-                    self.iter_offset = self._slider_x_to_offset(event.pos[0])
-                    self._auto_iter()
+                    if self._is_3d_mode():
+                        self.mandelbulb_max_iter = self._slider_3d_x_to_iter(event.pos[0])
+                        self.needs_compute = True
+                    else:
+                        self.iter_offset = self._slider_x_to_offset(event.pos[0])
+                        self._auto_iter()
+                        self.needs_compute = True
+                elif self.orbit_dragging:
+                    dx = event.pos[0] - self.orbit_drag_start[0]
+                    dy = event.pos[1] - self.orbit_drag_start[1]
+                    self.cam_azimuth = self.orbit_azimuth_start - dx * 0.005
+                    self.cam_elevation = self.orbit_elevation_start + dy * 0.005
+                    self.cam_elevation = max(-math.pi/2 + 0.01, min(math.pi/2 - 0.01, self.cam_elevation))
                     self.needs_compute = True
                 elif self.dragging:
                     self._handle_drag(event.pos)
@@ -1583,8 +1964,15 @@ class FractalMonkey:
             elif event.type == pygame.MOUSEWHEEL:
                 mpos = pygame.mouse.get_pos()
                 if not self._point_in_panel(*mpos) and not self._point_in_slider(*mpos):
-                    self.animating = False
-                    self._handle_zoom(event.y)
+                    if self._is_3d_mode():
+                        if event.y > 0:
+                            self.cam_distance = max(0.5, self.cam_distance / 1.15)
+                        elif event.y < 0:
+                            self.cam_distance = min(20.0, self.cam_distance * 1.15)
+                        self.needs_compute = True
+                    else:
+                        self.animating = False
+                        self._handle_zoom(event.y)
 
             elif event.type == pygame.VIDEORESIZE:
                 self._handle_resize(event.w, event.h)
@@ -1692,10 +2080,24 @@ class FractalMonkey:
                 self.color_cycling = False
         elif event.key == pygame.K_LEFT:
             self.palette_id = (self.palette_id - 1) % len(PALETTE_NAMES)
-            self.needs_colorize = True
+            if self._is_3d_mode():
+                self.needs_compute = True
+            else:
+                self.needs_colorize = True
         elif event.key == pygame.K_RIGHT:
             self.palette_id = (self.palette_id + 1) % len(PALETTE_NAMES)
-            self.needs_colorize = True
+            if self._is_3d_mode():
+                self.needs_compute = True
+            else:
+                self.needs_colorize = True
+        elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS or event.key == pygame.K_KP_PLUS:
+            if self._is_3d_mode():
+                self.mandelbulb_power = min(16.0, self.mandelbulb_power + 0.5)
+                self.needs_compute = True
+        elif event.key == pygame.K_MINUS or event.key == pygame.K_KP_MINUS:
+            if self._is_3d_mode():
+                self.mandelbulb_power = max(2.0, self.mandelbulb_power - 0.5)
+                self.needs_compute = True
         elif event.key == pygame.K_LEFTBRACKET:
             self._do_action("fractal_prev")
         elif event.key == pygame.K_RIGHTBRACKET:
@@ -1741,7 +2143,7 @@ class FractalMonkey:
         self.anim_target_zoom = min(self.zoom * 8.0, MAX_ZOOM)
 
     def _update_animation(self):
-        if not self.animating:
+        if not self.animating or self._is_3d_mode():
             return
         t = (time.perf_counter() - self.anim_start_time) / self.anim_duration
         if t >= 1.0:
@@ -1814,7 +2216,10 @@ class FractalMonkey:
                 if self.color_cycling:
                     direction = 1.0 if self.color_cycling == "forward" else -1.0
                     self.color_offset += 0.005 * self.cycle_speed * direction
-                    self.needs_colorize = True
+                    if self._is_3d_mode():
+                        self.needs_compute = True
+                    else:
+                        self.needs_colorize = True
 
                 if self.needs_compute or self.needs_colorize:
                     self.render()
